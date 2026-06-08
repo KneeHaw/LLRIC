@@ -44,9 +44,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from datasets import ImageFolder
+from src.datasets import ImageFolder
 from models.image import image_models
 
+import matplotlib.pyplot as plt
+import numpy as np
 
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -66,7 +68,9 @@ class RateDistortionLoss(nn.Module):
             for likelihoods in output["likelihoods"].values()
         )
         out["mse_loss"] = self.mse(output["x_hat"], target)
-        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"]
+        out["vq_loss"] = output["vq_loss"].sum()
+        # print(out["vq_loss"].shape)
+        out["loss"] = self.lmbda * 255**2 * out["mse_loss"] + out["bpp_loss"] + out["vq_loss"]
 
         return out
 
@@ -141,7 +145,7 @@ def configure_optimizers(net, args):
     union_params = parameters | aux_parameters
 
     assert len(inter_params) == 0
-    assert len(union_params) - len(params_dict.keys()) == 0
+    # assert len(union_params) - len(params_dict.keys()) == 0
 
     optimizer = optim.Adam(
         (params_dict[n] for n in sorted(parameters)),
@@ -168,6 +172,7 @@ def train_one_epoch(
 
         out_net = model(d)
 
+        bwd_start_t = time.perf_counter_ns()
         out_criterion = criterion(out_net, d)
         out_criterion["loss"].backward()
         if clip_max_norm > 0:
@@ -177,16 +182,71 @@ def train_one_epoch(
         aux_loss = model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
+        model.update_bwd_t(time.perf_counter_ns() - bwd_start_t)
 
-        if i*len(d) % 5000 == 0:
+        # if i*len(d) % 5000 == 0:
+        iter = i // (int(len(train_dataloader) / 20))
+        # print(mod, i, len(train_dataloader))
+        if i % (int(len(train_dataloader) / 20)) == 0:
             logging.info(
-                f'[{i*len(d)}/{len(train_dataloader.dataset)}] | '
+                f'[{iter}/{20}] | '
+                # f'[{i*len(d)}/{len(train_dataloader.dataset)}] '
                 # f" ({100. * i / len(train_dataloader):.0f}%)]"
                 f'Loss: {out_criterion["loss"].item():.3f} | '
                 f'MSE loss: {out_criterion["mse_loss"].item():.5f} | '
                 f'Bpp loss: {out_criterion["bpp_loss"].item():.4f} | '
+                f'Lat loss: {out_criterion["vq_loss"].item():.5f} | '
                 f"Aux loss: {aux_loss.item():.2f}"
             )
+            model.print_timers()
+
+
+def sample_result(valid_loader, vae_model, images_dir='.', run_name="test"):
+    """
+    Take a sample of four images from the dataset for fidelity observations
+    """
+    vae_model.eval()
+    images = []
+    labels = []
+    num_samples = 4
+    idxs = [i for i in range(num_samples)]
+    
+    with torch.no_grad():
+        for i, item in enumerate(valid_loader):
+            print(i)
+            target = item
+            if i >= num_samples:
+                break        
+            target = target.cuda()
+            input_var = torch.autograd.Variable(item.cuda())
+            
+            # Forward pass
+            output = vae_model(input_var)["x_hat"]
+            out_np = np.transpose(output.cpu().detach().numpy(), (0, 2, 3, 1))  # Change to (B, H, W, C)
+            target_np = np.transpose(target.cpu().detach().numpy(), (0, 2, 3, 1))  # Change to (B, H, W, C)))
+            
+            select_target = target_np[0, :, :, :]
+            select_out = out_np[0, :, :, :]
+            images.append(select_target)
+            images.append(select_out)
+            err_mse = np.mean(np.square(select_out - select_target))
+            err_mae = np.mean(np.abs(select_out - select_target))
+            err_psnr = 10 * np.log10(1 / err_mse)
+            labels.append(f"{err_mae:.3f} | {err_mse:.3f} | {err_psnr: .3f}")
+             
+        fig, axes = plt.subplots(num_samples, 2, figsize=(6, 14))  # 8 rows, 2 columns
+
+        for i, ax in enumerate(axes.flat):
+            if i % 2 == 1:
+                ax.set_title(labels[i // 2])
+            ax.imshow(images[i], cmap='gray' if images[i].ndim == 2 else None)
+            ax.axis('off')  # Hide axis ticks and labels
+
+        plt.tight_layout()
+        plt.show()
+        print("Saving figure...", os.path.join(images_dir, f"{run_name}.png"))
+        plt.savefig(os.path.join(images_dir, f"{run_name}.png"))
+        plt.close()
 
 
 def test_epoch(epoch, test_dataloader, model, criterion):
@@ -197,6 +257,7 @@ def test_epoch(epoch, test_dataloader, model, criterion):
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
+    lat_loss = AverageMeter()
 
     with torch.no_grad():
         for d in test_dataloader:
@@ -208,22 +269,29 @@ def test_epoch(epoch, test_dataloader, model, criterion):
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
+            # lat_loss.update(out_criterion["vq_loss"])
 
     logging.info(
         f"Test epoch {epoch}: Average losses: "
         f"Loss: {loss.avg:.3f} | "
         f"MSE loss: {mse_loss.avg:.5f} | "
         f"Bpp loss: {bpp_loss.avg:.4f} | "
-        f"Aux loss: {aux_loss.avg:.2f}\n"
+        # f"Lat loss: {lat_loss.avg:.4f} | "
+        f"Aux loss: {aux_loss.avg:.2f} |\n"
+        
     )
-
+    
+    sample_result(test_dataloader, model)
+    
     return loss.avg
 
 
-def save_checkpoint(state, is_best, base_dir, filename="checkpoint.pth.tar"):
+def save_checkpoint(state, is_best, base_dir, model_name, filename=None):
+    if filename is None:
+        filename = model_name + "_checkpoint.pth.tar"
     torch.save(state, base_dir+filename)
     if is_best:
-        shutil.copyfile(base_dir+filename, base_dir+"checkpoint_best_loss.pth.tar")
+        shutil.copyfile(base_dir+filename, base_dir+f"{model_name}_checkpoint_best_loss.pth.tar")
 
 
 def parse_args(argv):
@@ -237,19 +305,19 @@ def parse_args(argv):
     parser.add_argument(
         "-d", "--dataset", 
         type=str,
-        default="tinylic",
+        default="/home/kneehaw/datasets/flicker",
         help="Training dataset",   
     )
     parser.add_argument(
         "-e", "--epochs",
         type=int,
-        default=400,
+        default=100,  # paper = 400
         help="Number of epochs (default: %(default)s)",
     )
     parser.add_argument(
         "-lr", "--learning-rate",
         type=float,
-        default=1e-4,
+        default=3e-4,
         help="Learning rate (default: %(default)s)",
     )
     parser.add_argument(
@@ -273,12 +341,12 @@ def parse_args(argv):
         help="Bit-rate distortion parameter (default: %(default)s)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=16, help="Batch size (default: %(default)s)"
+        "--batch-size", type=int, default=16, help="Per-device batch size (default: %(default)s)"
     )
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=1,
+        default=64,
         help="Test batch size (default: %(default)s)",
     )
     parser.add_argument(
@@ -293,11 +361,15 @@ def parse_args(argv):
         default=(256, 256),
         help="Size of the patches to be cropped (default: %(default)s)",
     )
-    parser.add_argument("--cuda", action="store_true", help="Use cuda")
+    parser.add_argument(
+        "--cuda", 
+        default=True, 
+        action="store_true", 
+        help="Use cuda")
     parser.add_argument(
         "--gpu-id",
         type=str,
-        default=0,
+        default="1,2,3",
         help="GPU ids (default: %(default)s)",
     )
     parser.add_argument(
@@ -313,11 +385,18 @@ def parse_args(argv):
         help="gradient clipping max norm (default: %(default)s",
     )
     parser.add_argument(
+        '--model-name', 
+        default="", 
+        type=str,
+        help='Result dir name', 
+    )
+    parser.add_argument(
         '--name', 
         default=datetime.now().strftime('%Y-%m-%d_%H_%M_%S'), 
         type=str,
         help='Result dir name', 
     )
+    
     parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
     args = parser.parse_args(argv)
     return args
@@ -355,10 +434,12 @@ def main(argv):
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-
+    device_count = torch.cuda.device_count() if args.cuda and torch.cuda.is_available() else 1
+    print("Device: ", device, " | Count: ", device_count)
+    
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size * device_count,
         num_workers=args.num_workers,
         shuffle=True,
         pin_memory=(device == "cuda"),
@@ -372,10 +453,27 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = image_models[args.model](quality=int(args.quality_level))
+    net = image_models[args.model](quality=int(args.quality_level), args=args)
     net = net.to(device)
     
+    source_dict = torch.load("/home/kneehaw/python_projects/LLRIC/isolated_TinyLIC/checkpoints/tinylic/3/frozenLRVQ_test2_checkpoint_best_loss.pth.tar", weights_only=True)["state_dict"]
+    target_dict = net.state_dict()
+
+    # 1. Filter out keys that do not exist in the target model
+    filtered_dict = target_dict
+    for k, v in source_dict.items():
+        if k.replace('module.llric', 'llric') in target_dict:
+            filtered_dict[k.replace('module.llric', 'llric')] = v
+    # filtered_dict = {k.replace('module.llric', 'llric'): v  }
+    # print(source_dict.keys(), target_dict.keys(), filtered_dict.keys())
+    # 2. Load the matching weights into your target model
+    # strict=False prevents errors due to any missing or extra keys
+    net.load_state_dict(filtered_dict, strict=False)
+    net.llric_blk.requires_grad_(False)
+    # print(net.llric_blk)
+    # exit()
     if args.cuda and torch.cuda.device_count() > 1:
+        print("Distributing model parallel...")
         net = CustomDataParallel(net)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
@@ -422,7 +520,8 @@ def main(argv):
                     "lr_scheduler": lr_scheduler.state_dict(),
                 },
                 is_best,
-                base_dir
+                base_dir,
+                args.model_name
             )
 
 

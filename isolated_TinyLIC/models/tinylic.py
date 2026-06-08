@@ -8,8 +8,10 @@ from src.ans import BufferedRansEncoder, RansDecoder
 from src.entropy_models import EntropyBottleneck, GaussianConditional
 from src.layers import ResViTBlock, MultistageMaskedConv2d
 from timm.models.layers import trunc_normal_
+from models.llric_block import LRVQ
 
-from src.utils import conv, deconv, update_registered_buffers, quantize_ste, \
+import time
+from .utils import conv, deconv, update_registered_buffers, quantize_ste, \
     Demultiplexer, Multiplexer, Demultiplexerv2, Multiplexerv2
 
 # From Balle's tensorflow compression examples
@@ -31,7 +33,7 @@ class TinyLIC(nn.Module):
             encoder and last layer of the hyperprior decoder)
     """
 
-    def __init__(self, N=128, M=320):
+    def __init__(self, N=128, M=320, args=None):
         super().__init__()
 
         depths = [2, 2, 6, 2, 2, 2]
@@ -47,6 +49,14 @@ class TinyLIC(nn.Module):
         self.num_iters = 4
         self.gamma = self.gamma_func(mode="cosine")
         self.M = M
+        self.args = args
+        
+        self.timers = {"fwd_total": 0.0,
+                       "bwd_total": 0.0,
+                       "encode": 0.0,
+                       "entropy": 0.0,
+                       "decode": 0.0,
+                       "llric": 0.0}
 
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))] 
@@ -189,6 +199,11 @@ class TinyLIC(nn.Module):
         )
         self.g_s7 = deconv(N, 3, kernel_size=5, stride=2)
 
+        model_name = "llric_test1"
+        if model_name.find('llric') > -1:
+            # self.llric_blk = LRVQ(rank=2, split_size=16, n_hid=M, embedding_dim=16, n_embed=8192)
+            self.llric_blk = LRVQ(rank=4, img_size=256, n_hid=512, embedding_dim=16, n_embed=8192, emb_ps=True)
+        
         self.entropy_bottleneck = EntropyBottleneck(N*3//2)
         self.gaussian_conditional = GaussianConditional(None)
 
@@ -278,7 +293,28 @@ class TinyLIC(nn.Module):
         )
 
         self.apply(self._init_weights)  
+        
+    def update_bwd_t(self, elapsed_t):
+        self.timers["bwd_total"] += elapsed_t
+        
+    def print_timers(self):
+        fwd_t = self.timers["fwd_total"]
+        bwd_t = self.timers["bwd_total"]
+        total_t = fwd_t + bwd_t
+        
+        frac_times = {}
+        for key, value in self.timers.items():
+            if key in ["fwd_total", "bwd_total"]: continue
+            frac_times[key] = value / fwd_t
+            
+        sorted_dict = dict(sorted(frac_times.items(), key=lambda item: item[1], reverse=True))
+        
+        print("----- Relative Timing of Model Components -----")
+        print(f"fwd_total ➡ {fwd_t/total_t:.4f}")
+        for key, value in sorted_dict.items(): print(f"\t↪  {key:<10} ➡ {value:.4f}")
+        print(f"bwd_total ➡ {bwd_t/total_t:.4f}")
 
+            
     def gamma_func(self, mode="cosine"):
         if mode == "linear":
             return lambda r: 1 - r
@@ -350,8 +386,23 @@ class TinyLIC(nn.Module):
         return {'relative_position_bias_table'}
 
     def forward(self, x):
-        y = self.g_a(x)
+        start_t = time.perf_counter_ns()
+        ########################################
+        ##### Insertion of patches (LLRIC)
+        ########################################
+        is_llric = self.args.model_name.find('llric') > -1
+        y_tilde = 0
+        if is_llric:
+            y_tilde, latent_loss, ind  = self.llric_blk(x)
+            
+        llric_t = time.perf_counter_ns()
+        self.timers["llric"] += llric_t - start_t
+            
+        y = self.g_a(x - y_tilde)
         z = self.h_a(y)
+        encode_t = time.perf_counter_ns()
+        self.timers["encode"] += encode_t - llric_t
+        
         _, z_likelihoods = self.entropy_bottleneck(z)
 
         z_offset = self.entropy_bottleneck._get_medians()
@@ -503,15 +554,33 @@ class TinyLIC(nn.Module):
                 _, y_slice_likelihood = self.gaussian_conditional(y_slice, scales_hat, means=means_hat)
                 y_likelihood.append(y_slice_likelihood)
 
+        entropy_t = time.perf_counter_ns()
+        self.timers["entropy"] += entropy_t - encode_t
+        
         y_hat = torch.cat(y_hat_slices, dim=1)
         y_likelihoods = torch.cat(y_likelihood, dim=1)
-
-        # Generate the image reconstruction.
         x_hat = self.g_s(y_hat)
-
+        output = x_hat
+        
+        decode_t = time.perf_counter_ns()
+        self.timers["decode"] += decode_t - entropy_t
+        
+        # print("LLRIC START")
+        # Generate the image reconstruction.
+        ########################################
+        ##### Insertion of patches (LLRIC)
+        ########################################
+            
+        output = output + y_tilde
+        
+        ########################################
+        # print("LLRIC END")
+        self.timers["fwd_total"] += time.perf_counter_ns() - start_t
         return {
-            "x_hat": x_hat,
+            "x_hat": output,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "vq_loss": latent_loss if is_llric else torch.tensor([0.0], device=output.device),
+            "sampled_lr": y_tilde,
         }
 
     def update(self, scale_table=None, force=False):
@@ -790,10 +859,10 @@ class TinyLIC(nn.Module):
         y_strings.append(y_string)
 
         return {"strings": [y_strings, z_strings], 
-                "shape": z.size()[-2:]
-                }
+                "shape": z.size()[-2:],
+                "y": y}
 
-    def decompress(self, strings, shape):
+    def decompress(self, strings, shape, y=None):
         assert isinstance(strings, list) and len(strings) == 2
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
 
@@ -986,10 +1055,19 @@ class TinyLIC(nn.Module):
                 
                 y_hat_slices.append(y_hat_slice)
         
+        
+        
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp_(0, 1)
 
-        return {"x_hat": x_hat}
+        is_llric = True #TODO: fix self.args.model_name.find('llric') > -1
+        y_tilde = None
+        if is_llric and y is not None:
+            y_tilde, latent_loss, ind  = self.llric_blk(y)
+            output = x_hat + y_tilde
+            return {"x_hat": output, "sampled_lr": y_tilde}
+        return {"x_hat": x_hat, "sampled_lr": y_tilde}
+
 
 
 

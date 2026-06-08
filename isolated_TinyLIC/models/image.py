@@ -31,6 +31,11 @@ from torch.hub import load_state_dict_from_url
 
 from .pretrained import load_pretrained
 
+from models.tinylic import TinyLIC
+model_architectures = {
+    "tinylic": TinyLIC,
+}
+
 __all__ = [
     "tinylic",
 ]
@@ -54,7 +59,7 @@ cfgs = {
 
 
 def _load_model(
-    architecture, metric, quality, pretrained=False, progress=True, **kwargs
+    architecture, args, metric, quality, pretrained=False, progress=True, **kwargs
 ):
     if architecture not in model_architectures:
         raise ValueError(f'Invalid architecture name "{architecture}"')
@@ -76,10 +81,10 @@ def _load_model(
         model = model_architectures[architecture].from_state_dict(state_dict)
         return model
 
-    model = model_architectures[architecture](*cfgs[architecture][quality], **kwargs)
+    model = model_architectures[architecture](*cfgs[architecture][quality], args, **kwargs)
     return model
 
-def tinylic(quality, metric="mse", pretrained=False, progress=True, **kwargs):
+def tinylic(args, quality, metric="mse", pretrained=False, progress=True, **kwargs):
     r"""Neural image compression framework from Ming Lu and Zhan Ma
     "High-Efficiency Lossy Image Coding Through Adaptive Neighborhood Information Aggregation"
 
@@ -89,17 +94,15 @@ def tinylic(quality, metric="mse", pretrained=False, progress=True, **kwargs):
         pretrained (bool): If True, returns a pre-trained model
         progress (bool): If True, displays a progress bar of the download to stderr
     """
+    print(metric)
     if metric not in ("mse", "ms-ssim"):
         raise ValueError(f'Invalid metric "{metric}"')
 
     if quality < 1 or quality > 8:
         raise ValueError(f'Invalid quality "{quality}", should be between (1, 8)')
 
-    return _load_model("tinylic", metric, quality, pretrained, progress, **kwargs)
+    return _load_model("tinylic", args, metric, quality, pretrained, progress, **kwargs)
 
-model_architectures = {
-    "tinylic": tinylic,
-}
 
 image_models = {
     "tinylic": tinylic,

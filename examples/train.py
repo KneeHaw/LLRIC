@@ -236,7 +236,8 @@ def parse_args(argv):
         help="Model architecture (default: %(default)s)",
     )
     parser.add_argument(
-        "-d", "--dataset", type=str, required=True, help="Training dataset"
+        "-d", "--dataset", type=str, required=False, help="Training dataset",
+        default="/home/kneehaw/datasets/ImageNet/"
     )
     parser.add_argument(
         "-e",

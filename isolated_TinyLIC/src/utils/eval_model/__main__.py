@@ -34,6 +34,12 @@ import json
 import math
 import os
 import sys
+print(sys.path)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+print("CWD:", os.getcwd())
+print("FILE DIR:", os.path.dirname(__file__))
+print("sys.path[0]:", sys.path[0])
 import time
 
 from collections import defaultdict
@@ -47,11 +53,11 @@ from PIL import Image
 from pytorch_msssim import ms_ssim
 from torchvision import transforms
 
-import compressai
+from models.image import image_models as pretrained_models
+from models.pretrained import load_pretrained as load_state_dict
+from models.image import model_architectures as architectures
 
-from compressai.zoo import image_models as pretrained_models
-from compressai.zoo import load_state_dict
-from compressai.zoo.image import model_architectures as architectures
+import src
 
 torch.backends.cudnn.deterministic = True
 torch.set_num_threads(1)
@@ -202,8 +208,8 @@ def setup_args():
     parent_parser.add_argument(
         "-c",
         "--entropy-coder",
-        choices=compressai.available_entropy_coders(),
-        default=compressai.available_entropy_coders()[0],
+        choices=src.available_entropy_coders(),
+        default=src.available_entropy_coders()[0],
         help="entropy coder (default: %(default)s)",
     )
     parent_parser.add_argument(
@@ -280,7 +286,7 @@ def main(argv):
         print("Error: no images found in directory.", file=sys.stderr)
         raise SystemExit(1)
 
-    compressai.set_entropy_coder(args.entropy_coder)
+    src.set_entropy_coder(args.entropy_coder)
 
     if args.source == "pretrained":
         runs = sorted(args.qualities)
@@ -298,7 +304,7 @@ def main(argv):
         if args.verbose:
             sys.stderr.write(log_fmt.format(*opts, run=run))
             sys.stderr.flush()
-        model = load_func(*opts, run)
+        model = load_func(None, *opts, run)
         if args.cuda and torch.cuda.is_available():
             model = model.to("cuda")
 
@@ -327,3 +333,5 @@ def main(argv):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+
+# python -m ./src/utils/eval_model checkpoint /kneehaw/datasets/flicker/ -a tinylic -p ./checkpoints/tinylic/3/base_100ep_bestL.tar --cuda

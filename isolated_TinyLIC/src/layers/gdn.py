@@ -33,7 +33,7 @@ import torch.nn.functional as F
 
 from torch import Tensor
 
-from compressai.ops.parametrizers import NonNegativeParametrizer
+from src.ops.parametrizers import NonNegativeParametrizer
 
 __all__ = ["GDN", "GDN1"]
 
