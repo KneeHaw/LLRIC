@@ -5,7 +5,7 @@ import torch.nn.init as init
 from torch import Tensor
 from einops.layers.torch import Rearrange
 from einops import rearrange
-from models.decoder import LowRankRefiner
+from src.models.decoder import LowRankRefiner
 from src.patch_utils import *
 
 
@@ -26,47 +26,41 @@ class ResidualBlock(nn.Module):
         return x + self.block(x)
     
 class LRVQ(nn.Module):
-    def __init__(self, rank, img_size, n_hid, embedding_dim, n_embed, emb_ps=False):
+    def __init__(self, rank, img_size, M, N, embedding_dim, n_embed, emb_ps=False):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.split_size = img_size // embedding_dim
         self.enc_dim = embedding_dim * 3 * (2*rank)
         self.rank = rank
         self.im_size = img_size
-        patch_dim = n_hid * embedding_dim ** 2
+        # patch_dim = n_hid * embedding_dim ** 2
         
         # Patch transformer
         self.emb = emb_ps
-        self.embed_patches = EmbedPatches(self.split_size, embedding_dim, 3 * embedding_dim ** 2, n_hid)
-        
-        self.entropy_encoder = Transformer(n_hid, 128, num_layers=2)
-        self.transformer = Transformer(n_hid, self.enc_dim, num_layers=2)
+        # self.embed_patches = EmbedPatches(self.split_size, embedding_dim, 3 * embedding_dim ** 2, n_hid)
+        self.proj_patches = nn.Sequential(
+            nn.Linear(N*16*3//2, N*12),
+            nn.LayerNorm(N*12),
+            nn.Linear(N*12, N*8),
+            nn.LayerNorm(N*8),
+        )
+        # self.entropy_trans = Transformer(M, 128, num_layers=2)
+        self.transformer = Transformer(N*8, self.enc_dim, num_layers=2)
         self.patch_trans = LowRankRefiner(embedding_dim)
         ##### Vector quantization
         self.quantizer = VQVAEQuantize(n_embed, embedding_dim)
         
-        self.smooth_conv = nn.Sequential(*[ResidualBlock(3, 3, 5)] * 3)
+        # self.smooth_conv = nn.Sequential(*[ResidualBlock(3, 3, 5)] * 3)
                 
                 
     def forward(self, x):
-        # Convert x to sequence
         # print(x.shape)
-        # if self.im_size > self.embedding_dim:
-        #     x = patches_from_tensor(x, self.embedding_dim)
-            
-        # print(x.shape)
-        # exit()
-        z_emb = x
-        if self.emb:
-            z_emb = self.embed_patches(x)
-        else:
-            z = torch.flatten(z, 2)
-            z = z.permute(0, 2, 1)
-            
-        # print(x.shape, z_emb.shape)
-        # exit()
+        z_emb = self.proj_patches(x)
+        # print(z_emb.shape)
         z_r = self.transformer(z_emb)
         
+        # print(z_r.shape)
+        # exit()
         ##### Vector quantization
         s_x = z_r.shape[1]
         z_q = rearrange(z_r, "b s (enc_emb emb) -> b (s enc_emb) emb", s = s_x, 
@@ -79,13 +73,13 @@ class LRVQ(nn.Module):
         x_hat = reconstruct(z_q, 1, self.rank, 3)
 
         # Refinement
-        z_u = self.entropy_encoder(z_emb).permute(1, 0, 2)
-        z_u = z_u.reshape(-1, z_u.shape[2])
-        x_hat = self.patch_trans(x_hat, z_u)
+        # z_u = self.entropy_trans(z_emb).permute(1, 0, 2)
+        # z_u = z_u.reshape(-1, z_u.shape[2])
+        # x_hat = self.patch_trans(x_hat, z_u)
 
         # Spatial placement
-        x_hat = torch.cat(torch.chunk(x_hat, 256 // self.embedding_dim, 0), -2)
-        x_hat = torch.cat(torch.chunk(x_hat, 256 // self.embedding_dim, 0), -1)
+        x_hat = torch.cat(torch.chunk(x_hat, self.im_size // self.embedding_dim, 0), -2)
+        x_hat = torch.cat(torch.chunk(x_hat, self.im_size // self.embedding_dim, 0), -1)
         
         x_hat = x_hat.clamp(0.0, 1.0) 
         # x_hat = x_hat / torch.max(x_hat)
@@ -197,7 +191,7 @@ class EmbedPatches(nn.Module):
         super().__init__()
         print(f"Patches = {split_size} ({embedding_dim}, {embedding_dim})")
         self.to_patch_embedding = nn.Sequential(
-            Rearrange("b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1 = embedding_dim, p2 = embedding_dim),
+            # ,
             # nn.LayerNorm(patch_dim),
             nn.Linear(patch_dim, n_hid),   
             # nn.LayerNorm(2*n_hid),

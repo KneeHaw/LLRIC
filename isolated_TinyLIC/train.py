@@ -45,10 +45,41 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from src.datasets import ImageFolder
-from models.image import image_models
+from src.models.image import image_models
+from src.data_loaders import get_loaders
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+##################################################
+##### Monkey Patching
+##################################################
+MACS_FILE = "./saved/MACS.csv"
+with open (MACS_FILE, 'w') as f:
+    f.write("Layer,MACS\n")
+
+_original_init = nn.Linear.__init__
+
+def patched_init(self, in_features, out_features, *args, **kwargs):
+    # print(f"Linear: {in_features} -> {out_features}")
+    # print(f">> MACS: {in_features * out_features}")
+    with open (MACS_FILE, 'a') as f:
+        f.write(f"Linear,{in_features * out_features}\n")
+    _original_init(self, in_features, out_features, *args, **kwargs)
+
+nn.Linear.__init__ = patched_init
+
+# _original_init = nn.Conv2d.__init__
+
+# def patched_init(self, in_features, out_features, kernel_size, stride, *args, **kwargs):
+#     print(f"Conv2d: {in_features} -> {out_features}, kernel_size: {kernel_size}, stride: {stride}")
+#     print(f"MACS: {in_features * out_features * kernel_size[0] * kernel_size[1]}")
+#     _original_init(self, in_features, out_features, kernel_size, stride, *args, **kwargs)
+
+# nn.Conv2d.__init__ = patched_init
+##################################################
+
 
 class RateDistortionLoss(nn.Module):
     """Custom rate distortion loss with a Lagrangian parameter."""
@@ -102,10 +133,13 @@ class CustomDataParallel(nn.DataParallel):
 
 
 def init(args):
-    base_dir = f'./checkpoints/{args.model}/{args.quality_level}/'
+    base_dir = f'./saved/checkpoints/{args.model_name}'# /{args.quality_level}/'
     os.makedirs(base_dir, exist_ok=True)
 
-    return base_dir
+    imgs_dir = f'./saved/images/{args.model_name}'# /{args.quality_level}/'
+    os.makedirs(imgs_dir, exist_ok=True)
+
+    return base_dir, imgs_dir
 
 
 def setup_logger(log_dir):
@@ -171,6 +205,7 @@ def train_one_epoch(
         aux_optimizer.zero_grad()
 
         out_net = model(d)
+        # exit("STOPPING AFTER FIRST BATCH: LINE 205 train.py")
 
         bwd_start_t = time.perf_counter_ns()
         out_criterion = criterion(out_net, d)
@@ -199,12 +234,15 @@ def train_one_epoch(
                 f"Aux loss: {aux_loss.item():.2f}"
             )
             model.print_timers()
+            
+    sample_result(train_dataloader, model, add_str=f"_epoch{epoch}")
 
-
-def sample_result(valid_loader, vae_model, images_dir='.', run_name="test"):
+imgs_dir = None
+def sample_result(valid_loader, vae_model, images_dir='.', run_name="test", add_str=""):
     """
     Take a sample of four images from the dataset for fidelity observations
     """
+    global imgs_dir
     vae_model.eval()
     images = []
     labels = []
@@ -244,8 +282,9 @@ def sample_result(valid_loader, vae_model, images_dir='.', run_name="test"):
 
         plt.tight_layout()
         plt.show()
-        print("Saving figure...", os.path.join(images_dir, f"{run_name}.png"))
-        plt.savefig(os.path.join(images_dir, f"{run_name}.png"))
+        fname = f"{run_name}{add_str}.png"
+        print("Saving figure...", os.path.join(imgs_dir, fname))
+        plt.savefig(os.path.join(imgs_dir, fname))
         plt.close()
 
 
@@ -303,9 +342,15 @@ def parse_args(argv):
         help="Model architecture (default: %(default)s)",
     )
     parser.add_argument(
+        "--dataset-root", 
+        type=str,
+        default="/home/kneehaw/datasets/",
+        help="Root of dataset(s)",   
+    )
+    parser.add_argument(
         "-d", "--dataset", 
         type=str,
-        default="/home/kneehaw/datasets/flicker",
+        default="CELEBA",
         help="Training dataset",   
     )
     parser.add_argument(
@@ -317,7 +362,7 @@ def parse_args(argv):
     parser.add_argument(
         "-lr", "--learning-rate",
         type=float,
-        default=3e-4,
+        default=1e-4,
         help="Learning rate (default: %(default)s)",
     )
     parser.add_argument(
@@ -341,12 +386,12 @@ def parse_args(argv):
         help="Bit-rate distortion parameter (default: %(default)s)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=16, help="Per-device batch size (default: %(default)s)"
+        "--batch-size", type=int, default=48, help="Per-device batch size (default: %(default)s)"
     )
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=64,
+        default=48,
         help="Test batch size (default: %(default)s)",
     )
     parser.add_argument(
@@ -358,7 +403,7 @@ def parse_args(argv):
         "--patch-size",
         type=int,
         nargs=2,
-        default=(256, 256),
+        default=(64, 64),
         help="Size of the patches to be cropped (default: %(default)s)",
     )
     parser.add_argument(
@@ -404,7 +449,9 @@ def parse_args(argv):
 
 def main(argv):
     args = parse_args(argv)
-    base_dir = init(args)
+    base_dir, _imgs_dir = init(args)
+    global imgs_dir 
+    imgs_dir = _imgs_dir
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -417,61 +464,19 @@ def main(argv):
         logging.info(k + ':' + str(args.__dict__[k]))
     logging.info('=' * len(msg))
 
-    train_transforms = transforms.Compose([
-        transforms.RandomCrop(args.patch_size), 
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.ToTensor()
-        ]
-    )
-
-    test_transforms = transforms.Compose(
-        [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
-    )
-
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
-
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     device_count = torch.cuda.device_count() if args.cuda and torch.cuda.is_available() else 1
     print("Device: ", device, " | Count: ", device_count)
     
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size * device_count,
-        num_workers=args.num_workers,
-        shuffle=True,
-        pin_memory=(device == "cuda"),
-    )
-
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=args.test_batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        pin_memory=(device == "cuda"),
-    )
+    train_dataloader, val_dataloader, test_dataloader, im_size = get_loaders(args=args, 
+                                                                             worker_init_fn=None, 
+                                                                             dev_count=device_count, 
+                                                                             device=device)
 
     net = image_models[args.model](quality=int(args.quality_level), args=args)
     net = net.to(device)
-    
-    source_dict = torch.load("/home/kneehaw/python_projects/LLRIC/isolated_TinyLIC/checkpoints/tinylic/3/frozenLRVQ_test2_checkpoint_best_loss.pth.tar", weights_only=True)["state_dict"]
-    target_dict = net.state_dict()
-
-    # 1. Filter out keys that do not exist in the target model
-    filtered_dict = target_dict
-    for k, v in source_dict.items():
-        if k.replace('module.llric', 'llric') in target_dict:
-            filtered_dict[k.replace('module.llric', 'llric')] = v
-    # filtered_dict = {k.replace('module.llric', 'llric'): v  }
-    # print(source_dict.keys(), target_dict.keys(), filtered_dict.keys())
-    # 2. Load the matching weights into your target model
-    # strict=False prevents errors due to any missing or extra keys
-    net.load_state_dict(filtered_dict, strict=False)
-    net.llric_blk.requires_grad_(False)
-    # print(net.llric_blk)
-    # exit()
+        
     if args.cuda and torch.cuda.device_count() > 1:
         print("Distributing model parallel...")
         net = CustomDataParallel(net)
@@ -490,6 +495,33 @@ def main(argv):
         aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
+        # if all([args.model_name.find('llric') > -1, args.model_name.find('frozen') > -1]):
+        # logging.info("Loading LLRIC backbone")
+        # if all([args.model_name.find('llric') > -1]):
+        #     source_dict = torch.load("/home/kneehaw/python_projects/LLRIC/isolated_TinyLIC/saved/checkpoints/tinylic/3/celeba_llriconly1_checkpoint_best_loss.pth.tar", weights_only=True)["state_dict"]
+        #     target_dict = net.state_dict()
+        #     filtered_dict = target_dict
+        #     # for k, v in target_dict.items():
+        #     #     if k.find('llric') == -1: continue
+        #     #     print(k)
+                
+        #     for k, v in source_dict.items():
+        #         if k.find('llric') == -1: continue
+        #         if (k in target_dict.keys()): #.replace('module.llric', 'llric') 
+        #             # print(k)
+        #             filtered_dict[k] = v
+        #     # exit()
+        #     # print(filtered_dict.keys())
+        #     # exit()
+        #     net.load_state_dict(filtered_dict, strict=False)
+        #     # net.llric_blk.requires_grad_(False)
+        
+        logging.info("Testing loaded model...")
+        sample_result(test_dataloader, net)
+        # loss = test_epoch(0, test_dataloader, net, criterion)
+        exit()
+        
+        
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
         logging.info('======Current epoch %s ======'%epoch)

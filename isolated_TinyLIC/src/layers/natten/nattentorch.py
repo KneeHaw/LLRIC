@@ -8,7 +8,7 @@ LICENSE file in the root directory of this source tree.
 from torch import nn
 import torch
 from torch.nn.functional import unfold, pad
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_
 import warnings
 
 

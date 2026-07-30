@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.autograd import Function
 
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 
 from .gdn import GDN
 from natten import NeighborhoodAttention2D

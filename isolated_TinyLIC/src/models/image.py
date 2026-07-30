@@ -31,7 +31,7 @@ from torch.hub import load_state_dict_from_url
 
 from .pretrained import load_pretrained
 
-from models.tinylic import TinyLIC
+from src.models.tinylic import TinyLIC
 model_architectures = {
     "tinylic": TinyLIC,
 }

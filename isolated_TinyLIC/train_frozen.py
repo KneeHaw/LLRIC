@@ -17,15 +17,16 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from src.datasets import ImageFolder
-from models.image import image_models
+from src.models.image import image_models
 
 import torch
 import torch.nn as nn
-from models.utils import conv, deconv, update_registered_buffers, quantize_ste, \
+from src.models.utils import conv, deconv, update_registered_buffers, quantize_ste, \
     Demultiplexer, Multiplexer, Demultiplexerv2, Multiplexerv2
 from src.layers import ResViTBlock, MultistageMaskedConv2d
-from timm.models.layers import trunc_normal_
-from models.llric_block import LRVQ
+from timm.layers import trunc_normal_
+from src.models.llric_block import LRVQ
+from src.data_loaders import get_loaders
 
 
 class LR_frozen(nn.Module):
@@ -93,7 +94,7 @@ class LR_frozen(nn.Module):
                         norm_layer=norm_layer,
         )
         
-        self.llric_blk = LRVQ(rank=4, img_size=256, n_hid=512, embedding_dim=16, n_embed=8192, emb_ps=True)
+        self.llric_blk = LRVQ(rank=4, img_size=64, n_hid=512, embedding_dim=16, n_embed=8192, emb_ps=True)
         
     def gamma_func(self, mode="cosine"):
         if mode == "linear":
@@ -387,10 +388,25 @@ def parse_args(argv):
         help="Model architecture (default: %(default)s)",
     )
     parser.add_argument(
+        "--dataset-root", 
+        type=str,
+        default="/home/kneehaw/datasets/",
+        help="Root of dataset(s)",   
+    )
+    parser.add_argument(
         "-d", "--dataset", 
         type=str,
-        default="/home/kneehaw/datasets/flicker",
+        default="CELEBA",
         help="Training dataset",   
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=256, help="Per-device batch size (default: %(default)s)"
+    )
+    parser.add_argument(
+        "--test-batch-size",
+        type=int,
+        default=256,
+        help="Test batch size (default: %(default)s)",
     )
     parser.add_argument(
         "-e", "--epochs",
@@ -425,15 +441,6 @@ def parse_args(argv):
         help="Bit-rate distortion parameter (default: %(default)s)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=16, help="Per-device batch size (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--test-batch-size",
-        type=int,
-        default=64,
-        help="Test batch size (default: %(default)s)",
-    )
-    parser.add_argument(
         "--aux-learning-rate",
         default=1e-4,
         help="Auxiliary loss learning rate (default: %(default)s)",
@@ -442,7 +449,7 @@ def parse_args(argv):
         "--patch-size",
         type=int,
         nargs=2,
-        default=(256, 256),
+        default=(64, 64),
         help="Size of the patches to be cropped (default: %(default)s)",
     )
     parser.add_argument(
@@ -504,41 +511,16 @@ def main(argv):
         logging.info(k + ':' + str(args.__dict__[k]))
     logging.info('=' * len(msg))
 
-    train_transforms = transforms.Compose([
-        transforms.RandomCrop(args.patch_size), 
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.ToTensor()
-        ]
-    )
-
-    test_transforms = transforms.Compose(
-        [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
-    )
-
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
-
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     device_count = torch.cuda.device_count() if args.cuda and torch.cuda.is_available() else 1
     print("Device: ", device, " | Count: ", device_count)
     print("Lambda: ", args.lmbda)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size * device_count,
-        num_workers=args.num_workers,
-        shuffle=True,
-        pin_memory=(device == "cuda"),
-    )
-
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=args.test_batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        pin_memory=(device == "cuda"),
-    )
+    
+    train_dataloader, val_dataloader, test_dataloader, im_size = get_loaders(args=args, 
+                                                                             worker_init_fn=None, 
+                                                                             dev_count=device_count, 
+                                                                             device=device)
 
     net = LR_frozen(args=args)
     net = net.to(device)

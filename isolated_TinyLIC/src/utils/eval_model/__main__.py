@@ -53,9 +53,9 @@ from PIL import Image
 from pytorch_msssim import ms_ssim
 from torchvision import transforms
 
-from models.image import image_models as pretrained_models
-from models.pretrained import load_pretrained as load_state_dict
-from models.image import model_architectures as architectures
+from src.models.image import image_models as pretrained_models
+from src.models.pretrained import load_pretrained as load_state_dict
+from src.models.image import model_architectures as architectures
 
 import src
 

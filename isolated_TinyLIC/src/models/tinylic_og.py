@@ -7,8 +7,8 @@ import torch.nn as nn
 from src.ans import BufferedRansEncoder, RansDecoder
 from src.entropy_models import EntropyBottleneck, GaussianConditional
 from src.layers import ResViTBlock, MultistageMaskedConv2d
-from timm.models.layers import trunc_normal_
-from models.llric_block import LRVQ
+from timm.layers import trunc_normal_
+from src.models.llric_block import LRVQ
 
 import time
 from .utils import conv, deconv, update_registered_buffers, quantize_ste, \
@@ -83,7 +83,7 @@ class TinyLIC(nn.Module):
                         drop_path_rate=dpr[sum(depths[:1]):sum(depths[:2])],
                         norm_layer=norm_layer,
         )
-        self.g_a4 = conv(N*3//2, N*2, kernel_size=3, stride=2)
+        self.g_a4 = conv(N*3//2, N*2, kernel_size=3, stride=1)
         self.g_a5 = ResViTBlock(dim=N*2,
                         depth=depths[2],
                         num_heads=num_heads[2],
@@ -94,7 +94,7 @@ class TinyLIC(nn.Module):
                         drop_path_rate=dpr[sum(depths[:2]):sum(depths[:3])],
                         norm_layer=norm_layer,
         )
-        self.g_a6 = conv(N*2, M, kernel_size=3, stride=2)
+        self.g_a6 = conv(N*2, M, kernel_size=3, stride=1)
         self.g_a7 = ResViTBlock(dim=M,
                         depth=depths[3],
                         num_heads=num_heads[3],
@@ -164,7 +164,7 @@ class TinyLIC(nn.Module):
                         drop_path_rate=dpr[sum(depths[:2]):sum(depths[:3])],
                         norm_layer=norm_layer,
         )
-        self.g_s1 = deconv(M, N*2, kernel_size=3, stride=2)
+        self.g_s1 = deconv(M, N*2, kernel_size=3, stride=1)
         self.g_s2 = ResViTBlock(dim=N*2,
                         depth=depths[3],
                         num_heads=num_heads[3],
@@ -175,7 +175,7 @@ class TinyLIC(nn.Module):
                         drop_path_rate=dpr[sum(depths[:3]):sum(depths[:4])],
                         norm_layer=norm_layer,
         )
-        self.g_s3 = deconv(N*2, N*3//2, kernel_size=3, stride=2)
+        self.g_s3 = deconv(N*2, N*3//2, kernel_size=3, stride=1)
         self.g_s4 = ResViTBlock(dim=N*3//2,
                         depth=depths[4],
                         num_heads=num_heads[4],
@@ -199,10 +199,38 @@ class TinyLIC(nn.Module):
         )
         self.g_s7 = deconv(N, 3, kernel_size=5, stride=2)
 
-        model_name = "llric_test1"
-        if model_name.find('llric') > -1:
-            # self.llric_blk = LRVQ(rank=2, split_size=16, n_hid=M, embedding_dim=16, n_embed=8192)
-            self.llric_blk = LRVQ(rank=4, img_size=256, n_hid=512, embedding_dim=16, n_embed=8192, emb_ps=True)
+        # model_name = "llric_test1"
+        # if model_name.find('llric') > -1:
+        #     # self.llric_blk = LRVQ(rank=2, split_size=16, n_hid=M, embedding_dim=16, n_embed=8192)
+        #     self.llric_blk = LRVQ(rank=4, img_size=64, n_hid=512, embedding_dim=16, n_embed=8192, emb_ps=True)
+
+        #     # Learned gain applied to the residual before it enters g_a.
+        #     # Initialized to 1 so training starts from the identity; the network
+        #     # can shrink or amplify the residual signal into a range the LIC
+        #     # entropy model handles well.
+        #     self.residual_gain = nn.Parameter(torch.ones(1))
+
+        #     # Lightweight projection that maps the low-rank reconstruction
+        #     # (y_tilde, 3-channel RGB) down to N feature channels at stride 2
+        #     # so it can be concatenated with the g_a0 output as side-channel
+        #     # context.  This lets the encoder "know" what the LRVQ already
+        #     # reconstructed and focus its capacity on the true residual.
+        #     self.lrvq_context_proj = nn.Sequential(
+        #         conv(3, N // 2, kernel_size=3, stride=2),
+        #         nn.GELU(),
+        #         conv(N // 2, N, kernel_size=3, stride=1),
+        #     )
+
+        #     # 1x1 fusion conv that merges the g_a0 features (N ch) with the
+        #     # projected LRVQ context (N ch) back down to N channels before
+        #     # continuing through the rest of g_a.
+        #     self.lrvq_context_fuse = conv(N * 2, N, kernel_size=1, stride=1)
+
+        # Curriculum λ weight: multiplied into the distortion term of the loss
+        # in the training loop.  Start high (pure distortion) and anneal toward
+        # 1.0 so the entropy model has a chance to learn a useful signal before
+        # rate pressure turns "transmit nothing" into a local minimum.
+        self.register_buffer("lambda_weight", torch.tensor(1.0))
         
         self.entropy_bottleneck = EntropyBottleneck(N*3//2)
         self.gaussian_conditional = GaussianConditional(None)
@@ -315,6 +343,19 @@ class TinyLIC(nn.Module):
         print(f"bwd_total ➡ {bwd_t/total_t:.4f}")
 
             
+    def set_lambda_weight(self, w: float):
+        """Set the distortion curriculum weight (call from training loop).
+
+        During early training, pass a large value (e.g. 10–50) so the LIC is
+        forced to encode something useful before rate pressure kicks in.  Anneal
+        toward 1.0 over the first N epochs.  Example schedule:
+
+            for epoch in range(total_epochs):
+                w = max(1.0, 20.0 * (1 - epoch / warmup_epochs))
+                model.set_lambda_weight(w)
+        """
+        self.lambda_weight.fill_(w)
+
     def gamma_func(self, mode="cosine"):
         if mode == "linear":
             return lambda r: 1 - r
@@ -327,8 +368,22 @@ class TinyLIC(nn.Module):
         else:
             raise NotImplementedError  
 
-    def g_a(self, x):
+    def g_a(self, x, lrvq_context=None):
+        """Analysis transform.
+
+        Args:
+            x: Input image (or scaled residual when LRVQ is active).
+            lrvq_context: Optional projected LRVQ reconstruction features.
+                When provided they are concatenated with the g_a0 output and
+                fused via a 1x1 conv so the encoder has explicit side-channel
+                knowledge of what the low-rank stage already captured.
+        """
         x = self.g_a0(x)
+        if lrvq_context is not None:
+            # Fuse LRVQ context: gives the encoder a reference frame so it can
+            # focus on encoding the true residual rather than re-encoding the
+            # already-reconstructed signal.
+            x = self.lrvq_context_fuse(torch.cat([x, lrvq_context], dim=1))
         x = self.g_a1(x)
         x = self.g_a2(x)
         x = self.g_a3(x)
@@ -388,17 +443,38 @@ class TinyLIC(nn.Module):
     def forward(self, x):
         start_t = time.perf_counter_ns()
         ########################################
-        ##### Insertion of patches (LLRIC)
+        ##### Low-rank first-stage (LLRIC)
         ########################################
-        is_llric = self.args.model_name.find('llric') > -1
-        y_tilde = 0
-        if is_llric:
-            y_tilde, latent_loss, ind  = self.llric_blk(x)
-            
+        # is_llric = self.args.model_name.find('llric') > -1
+        # y_tilde = 0
+        lrvq_context = None
+        latent_loss = torch.tensor([0.0], device=x.device)
+
+        # if is_llric:
+        #     with torch.no_grad():
+        #         # LLRIC is frozen; detach so no gradient flows back into it.
+        #         y_tilde, latent_loss, ind = self.llric_blk(x)
+        #         y_tilde = y_tilde.detach()
+
+        #     # --- Correct residual ---
+        #     # The LIC sees and compresses (x - y_tilde), i.e. only what the
+        #     # low-rank stage failed to reconstruct.  A learned gain normalizes
+        #     # this residual into a numerically comfortable range; it is
+        #     # initialized to 1 and adapts during training.
+        #     residual = (x - y_tilde) * self.residual_gain
+
+        #     # --- Side-channel context ---
+        #     # Project y_tilde to N feature channels at the same spatial
+        #     # resolution as g_a0's output so the encoder has an explicit
+        #     # reference frame and can focus on the true residual content.
+        #     lrvq_context = self.lrvq_context_proj(y_tilde)
+        # else:
+        residual = x
+
         llric_t = time.perf_counter_ns()
         self.timers["llric"] += llric_t - start_t
-            
-        y = self.g_a(x - y_tilde)
+
+        y = self.g_a(residual, lrvq_context)
         z = self.h_a(y)
         encode_t = time.perf_counter_ns()
         self.timers["encode"] += encode_t - llric_t
@@ -556,31 +632,37 @@ class TinyLIC(nn.Module):
 
         entropy_t = time.perf_counter_ns()
         self.timers["entropy"] += entropy_t - encode_t
-        
+
         y_hat = torch.cat(y_hat_slices, dim=1)
         y_likelihoods = torch.cat(y_likelihood, dim=1)
         x_hat = self.g_s(y_hat)
-        output = x_hat
-        
+
         decode_t = time.perf_counter_ns()
         self.timers["decode"] += decode_t - entropy_t
-        
-        # print("LLRIC START")
-        # Generate the image reconstruction.
+
         ########################################
-        ##### Insertion of patches (LLRIC)
+        ##### Recombine residual + low-rank
         ########################################
-            
-        output = output + y_tilde
-        
-        ########################################
-        # print("LLRIC END")
+        # if is_llric:
+        #     # Undo the learned gain: x_hat is the compressed residual in
+        #     # gain-scaled space; divide back before adding y_tilde.
+        #     output = (x_hat / self.residual_gain) + y_tilde
+        # else:
+        output = x_hat
+        # y_tilde, latent_loss, ind = self.llric_blk(x)
+        # # output = y_tilde
+        # output = ((y_tilde ** 2 + output ** 2) / 2) ** 0.5
+        output = output.clamp(0.0, 1.0)
+
         self.timers["fwd_total"] += time.perf_counter_ns() - start_t
         return {
             "x_hat": output,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-            "vq_loss": latent_loss if is_llric else torch.tensor([0.0], device=output.device),
-            "sampled_lr": y_tilde,
+            "vq_loss": latent_loss,
+            "sampled_lr": None,
+            # Expose for training loop: multiply the distortion term of your
+            # R-D loss by this value.  Use set_lambda_weight() to schedule it.
+            "lambda_weight": self.lambda_weight,
         }
 
     def update(self, scale_table=None, force=False):
@@ -1024,6 +1106,7 @@ class TinyLIC(nn.Module):
                 sc_params[:, :, 0::2, 0::2] = 0
                 sc_params[:, :, 1::2, 1::2] = 0
                 
+                print(torch.cat((params, sc_params, cc_params), dim=1).shape)
                 gaussian_params = self.entropy_parameters_3(
                     torch.cat((params, sc_params, cc_params), dim=1)
                 )
@@ -1043,6 +1126,8 @@ class TinyLIC(nn.Module):
                 support_slices = torch.cat([params] + [y_hat_slices[i] for i in range(slice_index)], dim=1)
                 cc_params = self.cc_transforms[slice_index](support_slices)
 
+                print(torch.cat((params, sc_params, cc_params), dim=1).shape)
+                exit()
                 gaussian_params = self.entropy_parameters_4(
                     torch.cat((params, cc_params), dim=1)
                 )
@@ -1067,10 +1152,3 @@ class TinyLIC(nn.Module):
             output = x_hat + y_tilde
             return {"x_hat": output, "sampled_lr": y_tilde}
         return {"x_hat": x_hat, "sampled_lr": y_tilde}
-
-
-
-
-
-
-

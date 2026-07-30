@@ -43,7 +43,7 @@ from typing import Dict, List, Tuple
 
 from PIL import Image
 
-from compressai.utils.bench.codecs import AV1, BPG, HM, JPEG, JPEG2000, VTM, Codec, WebP
+from src.utils.bench.codecs import AV1, BPG, HM, JPEG, JPEG2000, VTM, Codec, WebP
 
 
 def get_codec_q_bounds(codec: Codec) -> Tuple[bool, int, int]:
