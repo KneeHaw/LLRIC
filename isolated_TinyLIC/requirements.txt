@@ -1,0 +1,9 @@
+torch
+torchvision
+matplotlib
+numpy
+timm
+einops
+imagesize
+scikit-learn
+pillow
